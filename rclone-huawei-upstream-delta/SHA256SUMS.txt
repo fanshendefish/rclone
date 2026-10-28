@@ -1,0 +1,11 @@
+bd98658fdfdec4c3ff1b9901103bca135013440760d2e55874982ccc20d70747  ./0001-huaweidrive-correctness.patch
+a085615c9d11513e40d025451c7337a59c443977e12065428df248c81ed14e75  ./CHANGELOG.md
+db3497d23771df3bb06a9a30cfd8b8b7ab3530c4b737ac99e33165a58df6fabd  ./README-MAINTENANCE.md
+07391a9ededea4d534b2c67753d7035a31c021c1f989b06b0393ca3346f17a98  ./rclone-official-9e0a5b66-source.tar.gz
+4b82a4eb72d121c9695ccae31f52b93a44433cd177368df37379eef0a0b22a5b  ./source-after/backend/huaweidrive/api/types.go
+60d7e7a26745c866169cb19ca6ab407ec33f99cabeef87b13a1b9fe7cc96c3da  ./source-after/backend/huaweidrive/api/types_test.go
+323a0a2e89b84cab87e42908d665d19b8fb1912d219593c45e08b4f646e47d8a  ./source-after/backend/huaweidrive/huaweidrive.go
+d3f947bb18d48c2fa4181c464eea16a4729903147bda83d30ce193db51d1744c  ./source-after/backend/huaweidrive/huaweidrive_test.go
+1ef7be9e5a39c10bfd9bd70220cc1404e65b98d0044c07a0f6d711577e338f44  ./source-before/backend/huaweidrive/api/types.go
+0376a0a86596cda8449468de17a5751e179de83ef6d66eff7fe46e8775d6be46  ./source-before/backend/huaweidrive/huaweidrive.go
+d5b84709bf9c7ec786a276e91503697dd50a906dac1d6568026ed7b1e44fe1fb  ./source-before/backend/huaweidrive/huaweidrive_test.go
