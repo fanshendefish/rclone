@@ -1,0 +1,880 @@
+diff --git a/backend/huaweidrive/api/types.go b/backend/huaweidrive/api/types.go
+index f029e6bc50a6bad6c7cf51f190188ca6288cffaa..1d7d1f708fb48c8d4ae37d0b3bed1ad911902e64 100644
+--- a/backend/huaweidrive/api/types.go
++++ b/backend/huaweidrive/api/types.go
+@@ -31,6 +31,7 @@ type User struct {
+ // FileList represents response to Files.list endpoint
+ type FileList struct {
+ 	Files         []File `json:"files"`
++	NextCursor    string `json:"nextCursor,omitempty"`
+ 	NextPageToken string `json:"nextPageToken,omitempty"`
+ 	Category      string `json:"category"`
+ }
+@@ -132,7 +133,6 @@ type CreateFolderRequest struct {
+ 	Favorite     bool                   `json:"favorite,omitempty"`
+ 	Properties   map[string]interface{} `json:"properties,omitempty"`
+ 	AppSettings  map[string]interface{} `json:"appSettings,omitempty"`
+-	AutoRename   int                    `json:"autoRename,omitempty"`
+ }
+ 
+ // UpdateFileRequest represents request to update a file
+diff --git a/backend/huaweidrive/api/types_test.go b/backend/huaweidrive/api/types_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..86961975d3b2010669d26eb7204af1f5b3332994
+--- /dev/null
++++ b/backend/huaweidrive/api/types_test.go
+@@ -0,0 +1,20 @@
++package api
++
++import (
++	"encoding/json"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestFileListNextCursor(t *testing.T) {
++	var result FileList
++	require.NoError(t, json.Unmarshal([]byte(`{"files":[],"nextCursor":"B009-test"}`), &result))
++	require.Equal(t, "B009-test", result.NextCursor)
++}
++
++func TestCreateFolderRequestDoesNotSerializeAutoRename(t *testing.T) {
++	data, err := json.Marshal(CreateFolderRequest{FileName: "empty.txt", MimeType: "text/plain"})
++	require.NoError(t, err)
++	require.NotContains(t, string(data), "autoRename")
++}
+diff --git a/backend/huaweidrive/huaweidrive.go b/backend/huaweidrive/huaweidrive.go
+index c1721130a82cfa92986ad62550885b7ca6d6b22a..a444326df7ded8b14ff47f77185e0aa272fcfd57 100644
+--- a/backend/huaweidrive/huaweidrive.go
++++ b/backend/huaweidrive/huaweidrive.go
+@@ -151,8 +151,8 @@ Custom metadata keys can be any string and will be stored in the file's properti
+ 			Advanced: true,
+ 		}, {
+ 			Name:     "list_chunk",
+-			Default:  1000,
+-			Help:     "Size of listing chunk 1-1000.",
++			Default:  100,
++			Help:     "Size of listing chunk 1-100.",
+ 			Advanced: true,
+ 		}, {
+ 			Name:     "upload_cutoff",
+@@ -509,7 +509,9 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut strin
+ 	// Encode the leaf name to match the stored (encoded) name in the API
+ 	encodedLeaf := f.opt.Enc.FromStandardName(leaf)
+ 	// Find the leaf in pathID
+-	found, err = f.listAll(ctx, pathID, func(item *api.File) bool {
++	filter := NewQueryFilter()
++	filter.AddFileName(encodedLeaf)
++	found, err = f.listDirectoryWithFilter(ctx, pathID, filter, func(item *api.File) bool {
+ 		if item.FileName == encodedLeaf && item.IsDir() {
+ 			pathIDOut = item.ID
+ 			return true
+@@ -620,13 +622,14 @@ func (f *Fs) listDirectoryWithFilter(ctx context.Context, dirID string, extraFil
+ 		opts.Parameters.Set("queryParam", queryParam)
+ 	}
+ 
+-	// Set page size if specified
+-	if f.opt.ListChunk > 0 && f.opt.ListChunk <= 1000 {
+-		opts.Parameters.Set("pageSize", strconv.Itoa(f.opt.ListChunk))
++	// Set page size if specified, clamped to Huawei's documented maximum.
++	if f.opt.ListChunk > 0 {
++		opts.Parameters.Set("pageSize", strconv.Itoa(min(f.opt.ListChunk, 100)))
+ 	}
+ 
+ 	fs.Debugf(f, "Listing directory %q", dirID)
+ 
++	seenPages := make(map[string]struct{})
+ 	for {
+ 		var result api.FileList
+ 		err = f.pacer.Call(func() (bool, error) {
+@@ -645,11 +648,29 @@ func (f *Fs) listDirectoryWithFilter(ctx context.Context, dirID string, extraFil
+ 			}
+ 		}
+ 
+-		// Check for more pages
+-		if result.NextPageToken == "" {
+-			break
++		// Huawei's current API uses nextCursor/cursor for pagination. Keep
++		// nextPageToken/pageToken as a fallback for older API variants.
++		if result.NextCursor != "" {
++			pageKey := "cursor:" + result.NextCursor
++			if _, seen := seenPages[pageKey]; seen {
++				return false, fmt.Errorf("couldn't list directory %q: repeated pagination cursor", dirID)
++			}
++			seenPages[pageKey] = struct{}{}
++			opts.Parameters.Del("pageToken")
++			opts.Parameters.Set("cursor", result.NextCursor)
++			continue
++		}
++		if result.NextPageToken != "" {
++			pageKey := "pageToken:" + result.NextPageToken
++			if _, seen := seenPages[pageKey]; seen {
++				return false, fmt.Errorf("couldn't list directory %q: repeated pagination token", dirID)
++			}
++			seenPages[pageKey] = struct{}{}
++			opts.Parameters.Del("cursor")
++			opts.Parameters.Set("pageToken", result.NextPageToken)
++			continue
+ 		}
+-		opts.Parameters.Set("pageToken", result.NextPageToken)
++		break
+ 	}
+ 
+ 	return found, nil
+@@ -859,7 +880,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
+ }
+ 
+ // isFileExistsErr reports whether err is the Huawei Drive "file already
+-// exists" / "auto-rename rejected" error returned when we set autoRename=3.
++// exists" / "auto-rename rejected" error returned when autoRename=false.
+ func isFileExistsErr(err error) bool {
+ 	if err == nil {
+ 		return false
+@@ -1402,6 +1423,18 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
+ 	if t != hash.SHA256 {
+ 		return "", hash.ErrUnsupported
+ 	}
++	// Huawei Drive can return a SHA256 which differs from the bytes served by
++	// Files.get(content) for some MP4 objects. This has only been reproduced
++	// when both the stored name has an .mp4 extension and the MIME type is
++	// video/mp4. An empty hash tells rclone not to compare this unreliable
++	// per-object value while preserving SHA256 support for other file types.
++	mediaType, _, err := mime.ParseMediaType(o.mimeType)
++	if err != nil {
++		mediaType = o.mimeType
++	}
++	if strings.EqualFold(mediaType, "video/mp4") && strings.EqualFold(path.Ext(o.remote), ".mp4") {
++		return "", nil
++	}
+ 	if o.sha256 == "" && o.size == 0 {
+ 		// Huawei Drive API does not return SHA256 for 0-byte files,
+ 		// so return the well-known SHA256 of empty content.
+@@ -1483,7 +1516,11 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.Fi
+ 		return nil, err
+ 	}
+ 
+-	found, err := f.listAll(ctx, directoryID, func(item *api.File) bool {
++	// Ask Huawei to filter by the encoded file name as well as parentFolder.
++	// Without this, looking up one object scans every page of a large directory.
++	filter := NewQueryFilter()
++	filter.AddFileName(f.opt.Enc.FromStandardName(leaf))
++	found, err := f.listDirectoryWithFilter(ctx, directoryID, filter, func(item *api.File) bool {
+ 		// Convert the API filename to standard name for comparison
+ 		standardName := f.opt.Enc.ToStandardName(item.FileName)
+ 		if standardName == leaf && !item.IsDir() {
+@@ -1658,16 +1695,12 @@ func (o *Object) uploadEmpty(ctx context.Context, leaf, directoryID string, src
+ 	if directoryID != "" {
+ 		req.ParentFolder = []string{directoryID}
+ 	}
+-	// Reject server-side auto-rename on duplicate filenames; see uploadMultipart.
+-	if o.id == "" {
+-		req.AutoRename = 3
+-	}
+-
+ 	opts := rest.Opts{
+ 		Method: "POST",
+ 		Path:   "/files",
+ 		Parameters: url.Values{
+-			"fields": []string{"*"},
++			"fields":     []string{"*"},
++			"autoRename": []string{"false"},
+ 		},
+ 	}
+ 
+@@ -1733,13 +1766,6 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, leaf, direct
+ 		metadata["parentFolder"] = []string{directoryID}
+ 	}
+ 
+-	// Reject server-side auto-rename on duplicate filenames so the caller can
+-	// detect conflicts and decide what to do (instead of getting a silently
+-	// renamed "file (1)").
+-	if o.id == "" {
+-		metadata["autoRename"] = 3
+-	}
+-
+ 	// Create multipart form
+ 	var buf bytes.Buffer
+ 	writer := multipart.NewWriter(&buf)
+@@ -1799,6 +1825,10 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, leaf, direct
+ 	} else {
+ 		// Create new file
+ 		opts.Path = "/files"
++		// Files.create requires autoRename as a boolean query parameter.
++		// Disabling it prevents a stale/racing listing from silently creating
++		// another renamed copy of an existing file.
++		opts.Parameters.Set("autoRename", "false")
+ 	}
+ 
+ 	var info *api.File
+@@ -1818,6 +1848,43 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, leaf, direct
+ 	return o.setMetaData(info)
+ }
+ 
++// resumeOffsetFromRange returns the first byte not yet acknowledged by the
++// resumable upload endpoint. Huawei returns a cumulative Range such as
++// "bytes=0-1048575" (some deployments use a space instead of '=') on 308.
++// Missing or ambiguous state is rejected so callers never guess which bytes
++// the server persisted.
++func resumeOffsetFromRange(rangeValue string, size int64) (int64, error) {
++	rangeValue = strings.TrimSpace(rangeValue)
++	if rangeValue == "" {
++		return 0, errors.New("308 response did not include a Range header")
++	}
++
++	lower := strings.ToLower(rangeValue)
++	var byteRange string
++	switch {
++	case strings.HasPrefix(lower, "bytes="):
++		byteRange = strings.TrimSpace(rangeValue[len("bytes="):])
++	case strings.HasPrefix(lower, "bytes "):
++		byteRange = strings.TrimSpace(rangeValue[len("bytes "):])
++	default:
++		return 0, fmt.Errorf("invalid resumable Range %q", rangeValue)
++	}
++
++	parts := strings.Split(byteRange, "-")
++	if len(parts) != 2 {
++		return 0, fmt.Errorf("invalid resumable Range %q", rangeValue)
++	}
++	start, err := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64)
++	if err != nil || start != 0 {
++		return 0, fmt.Errorf("invalid cumulative resumable Range %q", rangeValue)
++	}
++	end, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
++	if err != nil || end < start || end >= size {
++		return 0, fmt.Errorf("invalid resumable Range %q for size %d", rangeValue, size)
++	}
++	return end + 1, nil
++}
++
+ // uploadResume uploads a file using resumable upload for files >= upload_cutoff
+ func (o *Object) uploadResume(ctx context.Context, in io.Reader, leaf, directoryID string, size int64, modTime time.Time, src fs.ObjectInfo) (err error) {
+ 	// Use the main fs client for authentication
+@@ -1861,6 +1928,8 @@ func (o *Object) uploadResume(ctx context.Context, in io.Reader, leaf, directory
+ 	} else {
+ 		// Create new file
+ 		opts.Path = "/files"
++		// Files.create.resume uses the same query parameter as Files.create.
++		opts.Parameters.Set("autoRename", "false")
+ 	}
+ 
+ 	// Prepare metadata for resumable upload initialization
+@@ -1875,11 +1944,6 @@ func (o *Object) uploadResume(ctx context.Context, in io.Reader, leaf, directory
+ 		metadata["parentFolder"] = []string{directoryID}
+ 	}
+ 
+-	// Reject server-side auto-rename on duplicate filenames; see uploadMultipart.
+-	if o.id == "" {
+-		metadata["autoRename"] = 3
+-	}
+-
+ 	var resp *http.Response
+ 	var initResp api.ResumeUploadInitResponse
+ 	err = o.fs.pacer.Call(func() (bool, error) {
+@@ -1889,6 +1953,7 @@ func (o *Object) uploadResume(ctx context.Context, in io.Reader, leaf, directory
+ 	if err != nil {
+ 		return fmt.Errorf("failed to initialize resumable upload for %q: %w", leaf, err)
+ 	}
++	fs.Debugf(o, "resumable upload initialized: requestedChunkSize=%d serverSliceSize=%d size=%d", o.fs.opt.ChunkSize, initResp.SliceSize, size)
+ 
+ 	// Get the upload URL from Location header
+ 	location := resp.Header.Get("Location")
+@@ -1896,99 +1961,172 @@ func (o *Object) uploadResume(ctx context.Context, in io.Reader, leaf, directory
+ 		return fmt.Errorf("no upload URL returned for %q", leaf)
+ 	}
+ 
+-	// Now upload the content in chunks
+-	chunkSize := int64(o.fs.opt.ChunkSize)
+-	if chunkSize < 256*1024 {
+-		chunkSize = 256 * 1024 // Minimum chunk size according to Huawei Drive API
++	// The initialization response selects the slice size for this upload
++	// session. Use it verbatim: choosing a different local chunk size can leave
++	// the server with an incomplete final slice even though all bytes were sent.
++	chunkSize := initResp.SliceSize
++	if chunkSize <= 0 {
++		// Keep compatibility with older servers which omitted sliceSize.
++		chunkSize = int64(o.fs.opt.ChunkSize)
+ 	}
+-	if chunkSize > 64*1024*1024 {
+-		chunkSize = 64 * 1024 * 1024 // Maximum single upload size
++	if chunkSize <= 0 || chunkSize > 64*1024*1024 {
++		return fmt.Errorf("invalid resumable upload slice size %d for %q", chunkSize, leaf)
+ 	}
+ 
+ 	buf := make([]byte, chunkSize)
+ 	var offset int64
+ 
+ 	for offset < size {
+-		n, err := io.ReadFull(in, buf)
+-		if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+-			return fmt.Errorf("failed to read chunk at offset %d: %w", offset, err)
++		chunkStart := offset
++		want := min(chunkSize, size-chunkStart)
++		n, readErr := io.ReadFull(in, buf[:want])
++		if readErr != nil || int64(n) != want {
++			if readErr == nil {
++				readErr = io.ErrUnexpectedEOF
++			}
++			return fmt.Errorf("source ended before declared size at offset %d: read %d of %d bytes: %w", chunkStart, n, want, readErr)
+ 		}
+ 
+ 		chunk := buf[:n]
+-		end := offset + int64(n) - 1
+-
+-		// Upload this chunk using the original client with OAuth authentication
+-		chunkOpts := rest.Opts{
+-			Method:  "PUT",
+-			RootURL: location,
+-			Path:    "", // Empty path since RootURL contains the full URL
+-			ExtraHeaders: map[string]string{
+-				"Content-Range":  fmt.Sprintf("bytes %d-%d/%d", offset, end, size),
+-				"Content-Length": strconv.Itoa(n),
+-				"Content-Type":   mimeType,
+-			},
+-		}
++		chunkEnd := chunkStart + int64(n) - 1
++		sendOffset := chunkStart
++		noProgress := 0
++		finalPolls := 0
+ 
+-		var info *api.File
+-		var chunkResp *http.Response
+-		err = o.fs.pacer.Call(func() (bool, error) {
+-			chunkOpts.Body = bytes.NewReader(chunk)
+-			var err error
+-			chunkResp, err = srv.CallJSON(ctx, &chunkOpts, nil, &info)
+-			// 308 means continue uploading (incomplete)
+-			if chunkResp != nil && chunkResp.StatusCode == 308 {
+-				// Clear info for incomplete upload
+-				info = nil
+-				return false, nil
+-			}
+-			// 200/201 means upload complete - let the response be processed
+-			if chunkResp != nil && (chunkResp.StatusCode == 200 || chunkResp.StatusCode == 201) {
+-				return false, err // Return err (should be nil) to allow response processing
+-			}
+-			return shouldRetry(ctx, chunkResp, err)
+-		})
+-		if err != nil {
+-			return fmt.Errorf("failed to upload chunk at offset %d: %w", offset, err)
+-		}
++		for {
++			if sendOffset <= chunkEnd {
++				bodyOffset := sendOffset - chunkStart
++				body := chunk[bodyOffset:]
++				chunkOpts := rest.Opts{
++					Method:  "PUT",
++					RootURL: location,
++					Path:    "",
++					ExtraHeaders: map[string]string{
++						"Content-Range":  fmt.Sprintf("bytes %d-%d/%d", sendOffset, chunkEnd, size),
++						"Content-Length": strconv.Itoa(len(body)),
++						"Content-Type":   mimeType,
++					},
++				}
+ 
+-		offset += int64(n)
++				var info *api.File
++				var chunkResp *http.Response
++				err = o.fs.pacer.Call(func() (bool, error) {
++					chunkOpts.Body = bytes.NewReader(body)
++					var callErr error
++					chunkResp, callErr = srv.CallJSON(ctx, &chunkOpts, nil, &info)
++					if chunkResp != nil {
++						fs.Debugf(o, "resumable chunk response: status=%d range=%q sendOffset=%d chunkStart=%d chunkEnd=%d size=%d err=%v", chunkResp.StatusCode, chunkResp.Header.Get("Range"), sendOffset, chunkStart, chunkEnd, size, callErr)
++					}
++					// 308 is resumable-upload state, not a generic HTTP retry.
++					if chunkResp != nil && chunkResp.StatusCode == 308 {
++						info = nil
++						return false, nil
++					}
++					if chunkResp != nil && (chunkResp.StatusCode == 200 || chunkResp.StatusCode == 201) {
++						return false, callErr
++					}
++					return shouldRetry(ctx, chunkResp, callErr)
++				})
++				if err != nil {
++					return fmt.Errorf("failed to upload chunk at offset %d: %w", sendOffset, err)
++				}
++				if info != nil && info.ID != "" {
++					return o.setMetaData(info)
++				}
++				if chunkResp == nil || chunkResp.StatusCode != 308 {
++					return fmt.Errorf("upload chunk at offset %d returned no file info or resumable state", sendOffset)
++				}
+ 
+-		// If we got file info back, we're done
+-		if info != nil && info.ID != "" {
+-			return o.setMetaData(info)
+-		}
++				nextOffset, rangeErr := resumeOffsetFromRange(chunkResp.Header.Get("Range"), size)
++				if rangeErr != nil {
++					return fmt.Errorf("can't safely resume upload for %q after chunk at offset %d: %w", leaf, sendOffset, rangeErr)
++				}
++				if nextOffset < chunkStart {
++					return fmt.Errorf("can't safely resume upload for %q: server offset %d is before current in-memory chunk %d-%d", leaf, nextOffset, chunkStart, chunkEnd)
++				}
++				if nextOffset > chunkEnd+1 {
++					return fmt.Errorf("can't safely resume upload for %q: server offset %d is beyond current chunk end %d", leaf, nextOffset, chunkEnd)
++				}
++				if nextOffset <= sendOffset {
++					noProgress++
++					if noProgress >= 3 {
++						return fmt.Errorf("can't safely resume upload for %q: server made no progress at offset %d after %d attempts", leaf, sendOffset, noProgress)
++					}
++				} else {
++					noProgress = 0
++				}
++				sendOffset = nextOffset
++				continue
++			}
++
++			if chunkEnd+1 < size {
++				break
++			}
+ 
+-		// Check if this was the last chunk and upload is complete (308 with all bytes uploaded)
+-		if chunkResp != nil && chunkResp.StatusCode == 308 && offset >= size {
+-			// Upload is complete, but we need to get file info
+-			// Send a final request to get the created file info
++			// Huawei documents a zero-length PUT as the breakpoint-status query.
++			// Do not add protocol-specific Content-Range syntax unless Huawei's
++			// endpoint is verified to require it.
+ 			finalOpts := rest.Opts{
+ 				Method:  "PUT",
+ 				RootURL: location,
+ 				Path:    "",
+ 				ExtraHeaders: map[string]string{
+-					"Content-Range":  fmt.Sprintf("bytes */%d", size),
+ 					"Content-Length": "0",
+ 				},
+ 			}
+-
+ 			var finalInfo *api.File
++			var finalResp *http.Response
+ 			err = o.fs.pacer.Call(func() (bool, error) {
+-				finalOpts.Body = bytes.NewReader([]byte{})
+-				finalResp, err := srv.CallJSON(ctx, &finalOpts, nil, &finalInfo)
++				finalOpts.Body = bytes.NewReader(nil)
++				var callErr error
++				finalResp, callErr = srv.CallJSON(ctx, &finalOpts, nil, &finalInfo)
++				if finalResp != nil {
++					fs.Debugf(o, "resumable finalize response: status=%d range=%q size=%d err=%v", finalResp.StatusCode, finalResp.Header.Get("Range"), size, callErr)
++				}
++				if finalResp != nil && finalResp.StatusCode == 308 {
++					return false, nil
++				}
+ 				if finalResp != nil && (finalResp.StatusCode == 200 || finalResp.StatusCode == 201) {
+-					return false, err
++					return false, callErr
+ 				}
+-				return shouldRetry(ctx, finalResp, err)
++				return shouldRetry(ctx, finalResp, callErr)
+ 			})
+ 			if err != nil {
+ 				return fmt.Errorf("failed to finalize upload for %q: %w", leaf, err)
+ 			}
+-
+ 			if finalInfo != nil && finalInfo.ID != "" {
+ 				return o.setMetaData(finalInfo)
+ 			}
++			if finalResp == nil || finalResp.StatusCode != 308 {
++				return fmt.Errorf("failed to finalize upload for %q: no file info returned", leaf)
++			}
++
++			nextOffset, rangeErr := resumeOffsetFromRange(finalResp.Header.Get("Range"), size)
++			if rangeErr != nil {
++				return fmt.Errorf("can't safely finalize resumable upload for %q: %w", leaf, rangeErr)
++			}
++			if nextOffset < chunkStart {
++				return fmt.Errorf("can't safely finalize resumable upload for %q: server offset %d is before current in-memory chunk %d-%d", leaf, nextOffset, chunkStart, chunkEnd)
++			}
++			if nextOffset < size {
++				sendOffset = nextOffset
++				noProgress = 0
++				finalPolls = 0
++				continue
++			}
++
++			finalPolls++
++			if finalPolls >= 60 {
++				return fmt.Errorf("failed to finalize upload for %q: processing did not complete after %d status queries", leaf, finalPolls)
++			}
++			select {
++			case <-ctx.Done():
++				return ctx.Err()
++			case <-time.After(2 * time.Second):
++			}
+ 		}
++
++		offset = chunkEnd + 1
+ 	}
+ 
+ 	return fmt.Errorf("upload completed but no file info received for %q", leaf)
+diff --git a/backend/huaweidrive/huaweidrive_test.go b/backend/huaweidrive/huaweidrive_test.go
+index e5c72615fdc0d15da591c80dbe055bcfa02ed809..ab68e5c68cf3c0daf672414e46f7a5834d356831 100644
+--- a/backend/huaweidrive/huaweidrive_test.go
++++ b/backend/huaweidrive/huaweidrive_test.go
+@@ -1,13 +1,18 @@
+ package huaweidrive
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"io"
+ 	"mime"
+ 	"net/http"
++	"net/http/httptest"
+ 	"path"
+ 	"slices"
++	"strings"
+ 	"testing"
+ 	"time"
+ 
+@@ -17,6 +22,8 @@ import (
+ 	"github.com/rclone/rclone/fs/hash"
+ 	"github.com/rclone/rclone/fstest/fstests"
+ 	"github.com/rclone/rclone/lib/encoder"
++	"github.com/rclone/rclone/lib/pacer"
++	"github.com/rclone/rclone/lib/rest"
+ )
+ 
+ // TestIntegration runs integration tests against the remote
+@@ -84,6 +91,333 @@ func TestFsHashes(t *testing.T) {
+ 	}
+ }
+ 
++func TestObjectHashSkipsMP4Metadata(t *testing.T) {
++	ctx := context.Background()
++	const apiHash = "a0188526fc213c3390d8ae8be4b86ee6ba64eaba76e3bbe1ab5016b31568b226"
++	tests := []struct {
++		name     string
++		remote   string
++		mimeType string
++		want     string
++	}{
++		{name: "mp4", remote: "video.mp4", mimeType: "video/mp4", want: ""},
++		{name: "mp4 with parameters", remote: "video.MP4", mimeType: "video/mp4; charset=binary", want: ""},
++		{name: "extension only", remote: "video.mp4", mimeType: "application/octet-stream", want: apiHash},
++		{name: "mime only", remote: "video.bin", mimeType: "video/mp4", want: apiHash},
++		{name: "other file", remote: "document.pdf", mimeType: "application/pdf", want: apiHash},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			o := &Object{remote: test.remote, mimeType: test.mimeType, sha256: apiHash, size: 1}
++			got, err := o.Hash(ctx, hash.SHA256)
++			if err != nil {
++				t.Fatalf("Hash returned error: %v", err)
++			}
++			if got != test.want {
++				t.Fatalf("Hash = %q, want %q", got, test.want)
++			}
++		})
++	}
++}
++
++func TestResumeOffsetFromRange(t *testing.T) {
++	tests := []struct {
++		name       string
++		rangeValue string
++		size       int64
++		want       int64
++		wantErr    bool
++	}{
++		{name: "equals form", rangeValue: "bytes=0-9", size: 20, want: 10},
++		{name: "space form", rangeValue: "bytes 0-19", size: 20, want: 20},
++		{name: "case and whitespace", rangeValue: " Bytes=0-4 ", size: 10, want: 5},
++		{name: "missing", size: 20, wantErr: true},
++		{name: "wrong unit", rangeValue: "items=0-9", size: 20, wantErr: true},
++		{name: "non cumulative", rangeValue: "bytes=10-19", size: 20, wantErr: true},
++		{name: "past declared size", rangeValue: "bytes=0-20", size: 20, wantErr: true},
++		{name: "malformed", rangeValue: "bytes=abc", size: 20, wantErr: true},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			got, err := resumeOffsetFromRange(test.rangeValue, test.size)
++			if test.wantErr {
++				if err == nil {
++					t.Fatalf("resumeOffsetFromRange(%q, %d) unexpectedly succeeded with %d", test.rangeValue, test.size, got)
++				}
++				return
++			}
++			if err != nil {
++				t.Fatalf("resumeOffsetFromRange(%q, %d) returned error: %v", test.rangeValue, test.size, err)
++			}
++			if got != test.want {
++				t.Fatalf("resumeOffsetFromRange(%q, %d) = %d, want %d", test.rangeValue, test.size, got, test.want)
++			}
++		})
++	}
++}
++
++func newResumeTestObject(t *testing.T, handler http.HandlerFunc) (*Object, *httptest.Server) {
++	t.Helper()
++	server := httptest.NewServer(handler)
++	t.Cleanup(server.Close)
++	ctx := context.Background()
++	f := &Fs{
++		srv:       rest.NewClient(server.Client()).SetRoot(server.URL),
++		pacer:     fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(0), pacer.MaxSleep(0))),
++		uploadURL: server.URL,
++		opt:       Options{ChunkSize: 10},
++	}
++	return &Object{fs: f, remote: "test.bin"}, server
++}
++
++func writeResumeInit(t *testing.T, w http.ResponseWriter, serverURL string, sliceSize int64) {
++	t.Helper()
++	w.Header().Set("Content-Type", "application/json")
++	w.Header().Set("Location", serverURL+"/session")
++	fmt.Fprintf(w, `{"sliceSize":%d}`, sliceSize)
++}
++
++func writeUploadedFile(t *testing.T, w http.ResponseWriter, size int64) {
++	t.Helper()
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(http.StatusCreated)
++	fmt.Fprintf(w, `{"id":"uploaded","fileName":"test.bin","mimeType":"application/octet-stream","size":%d}`, size)
++}
++
++func TestUploadResumeResendsCurrentChunkSuffix(t *testing.T) {
++	ctx := context.Background()
++	data := []byte("0123456789abcdefghij")
++	request := 0
++	var server *httptest.Server
++	obj, server := newResumeTestObject(t, func(w http.ResponseWriter, r *http.Request) {
++		if r.URL.Path == "/files" {
++			if got := r.URL.Query().Get("autoRename"); got != "false" {
++				t.Errorf("autoRename query = %q, want false", got)
++			}
++			writeResumeInit(t, w, server.URL, 10)
++			return
++		}
++		body, err := io.ReadAll(r.Body)
++		if err != nil {
++			t.Errorf("reading request body: %v", err)
++		}
++		request++
++		switch request {
++		case 1:
++			if got := r.Header.Get("Content-Range"); got != "bytes 0-9/20" {
++				t.Errorf("first Content-Range = %q", got)
++			}
++			if !bytes.Equal(body, data[:10]) {
++				t.Errorf("first body = %q", body)
++			}
++			w.Header().Set("Range", "bytes=0-3")
++			w.WriteHeader(308)
++		case 2:
++			if got := r.Header.Get("Content-Range"); got != "bytes 4-9/20" {
++				t.Errorf("suffix Content-Range = %q", got)
++			}
++			if !bytes.Equal(body, data[4:10]) {
++				t.Errorf("suffix body = %q", body)
++			}
++			w.Header().Set("Range", "bytes=0-9")
++			w.WriteHeader(308)
++		case 3:
++			if got := r.Header.Get("Content-Range"); got != "bytes 10-19/20" {
++				t.Errorf("second chunk Content-Range = %q", got)
++			}
++			if !bytes.Equal(body, data[10:]) {
++				t.Errorf("second chunk body = %q", body)
++			}
++			writeUploadedFile(t, w, int64(len(data)))
++		default:
++			t.Errorf("unexpected request %d", request)
++		}
++	})
++
++	err := obj.uploadResume(ctx, bytes.NewReader(data), "test.bin", "root", int64(len(data)), time.Time{}, nil)
++	if err != nil {
++		t.Fatalf("uploadResume returned error: %v", err)
++	}
++	if request != 3 {
++		t.Fatalf("data requests = %d, want 3", request)
++	}
++}
++
++func TestUploadResumeFinalQueryResendsLastChunkSuffix(t *testing.T) {
++	ctx := context.Background()
++	data := []byte("0123456789abcdefghij")
++	request := 0
++	var server *httptest.Server
++	obj, server := newResumeTestObject(t, func(w http.ResponseWriter, r *http.Request) {
++		if r.URL.Path == "/files" {
++			writeResumeInit(t, w, server.URL, 10)
++			return
++		}
++		body, err := io.ReadAll(r.Body)
++		if err != nil {
++			t.Errorf("reading request body: %v", err)
++		}
++		request++
++		switch request {
++		case 1:
++			w.Header().Set("Range", "bytes=0-9")
++			w.WriteHeader(308)
++		case 2:
++			w.Header().Set("Range", "bytes=0-19")
++			w.WriteHeader(308)
++		case 3:
++			if len(body) != 0 || r.Header.Get("Content-Length") != "0" {
++				t.Errorf("status query body length=%d Content-Length=%q", len(body), r.Header.Get("Content-Length"))
++			}
++			if got := r.Header.Get("Content-Range"); got != "" {
++				t.Errorf("status query unexpectedly sent Content-Range %q", got)
++			}
++			w.Header().Set("Range", "bytes=0-14")
++			w.WriteHeader(308)
++		case 4:
++			if got := r.Header.Get("Content-Range"); got != "bytes 15-19/20" {
++				t.Errorf("resent Content-Range = %q", got)
++			}
++			if !bytes.Equal(body, data[15:]) {
++				t.Errorf("resent body = %q", body)
++			}
++			writeUploadedFile(t, w, int64(len(data)))
++		default:
++			t.Errorf("unexpected request %d", request)
++		}
++	})
++
++	err := obj.uploadResume(ctx, bytes.NewReader(data), "test.bin", "root", int64(len(data)), time.Time{}, nil)
++	if err != nil {
++		t.Fatalf("uploadResume returned error: %v", err)
++	}
++	if request != 4 {
++		t.Fatalf("session requests = %d, want 4", request)
++	}
++}
++
++func TestUploadResumeRejectsMissingRange(t *testing.T) {
++	ctx := context.Background()
++	data := []byte("0123456789")
++	var server *httptest.Server
++	obj, server := newResumeTestObject(t, func(w http.ResponseWriter, r *http.Request) {
++		if r.URL.Path == "/files" {
++			writeResumeInit(t, w, server.URL, 10)
++			return
++		}
++		w.WriteHeader(308)
++	})
++
++	err := obj.uploadResume(ctx, bytes.NewReader(data), "test.bin", "root", int64(len(data)), time.Time{}, nil)
++	if err == nil || !strings.Contains(err.Error(), "did not include a Range header") {
++		t.Fatalf("uploadResume error = %v, want missing Range failure", err)
++	}
++}
++
++func TestUploadResumeRejectsShortSource(t *testing.T) {
++	ctx := context.Background()
++	data := []byte("0123456789abcde")
++	request := 0
++	var server *httptest.Server
++	obj, server := newResumeTestObject(t, func(w http.ResponseWriter, r *http.Request) {
++		if r.URL.Path == "/files" {
++			writeResumeInit(t, w, server.URL, 10)
++			return
++		}
++		request++
++		w.Header().Set("Range", "bytes=0-9")
++		w.WriteHeader(308)
++	})
++
++	err := obj.uploadResume(ctx, bytes.NewReader(data), "test.bin", "root", 20, time.Time{}, nil)
++	if err == nil || !strings.Contains(err.Error(), "source ended before declared size") {
++		t.Fatalf("uploadResume error = %v, want short source failure", err)
++	}
++	if request != 1 {
++		t.Fatalf("data requests = %d, want 1", request)
++	}
++}
++
++func TestUploadEmptyUsesAutoRenameQuery(t *testing.T) {
++	ctx := context.Background()
++	var body map[string]any
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if got := r.URL.Query().Get("autoRename"); got != "false" {
++			t.Errorf("autoRename query = %q, want false", got)
++		}
++		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++			t.Errorf("decoding request body: %v", err)
++		}
++		if _, found := body["autoRename"]; found {
++			t.Error("autoRename must not be serialized in the JSON body")
++		}
++		writeUploadedFile(t, w, 0)
++	}))
++	defer server.Close()
++	f := &Fs{
++		srv:   rest.NewClient(server.Client()).SetRoot(server.URL),
++		pacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(0), pacer.MaxSleep(0))),
++	}
++	obj := &Object{fs: f, remote: "empty.txt"}
++	if err := obj.uploadEmpty(ctx, "empty.txt", "root", nil); err != nil {
++		t.Fatalf("uploadEmpty returned error: %v", err)
++	}
++}
++
++func TestListDirectoryUsesNextCursorAndPageSize100(t *testing.T) {
++	ctx := context.Background()
++	requests := 0
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		requests++
++		if got := r.URL.Query().Get("pageSize"); got != "100" {
++			t.Errorf("pageSize = %q, want 100", got)
++		}
++		w.Header().Set("Content-Type", "application/json")
++		switch requests {
++		case 1:
++			if got := r.URL.Query().Get("cursor"); got != "" {
++				t.Errorf("first cursor = %q, want empty", got)
++			}
++			files := make([]api.File, 100)
++			for i := range files {
++				files[i] = api.File{ID: fmt.Sprintf("id-%d", i), FileName: fmt.Sprintf("file-%d", i), MimeType: "application/octet-stream"}
++			}
++			if err := json.NewEncoder(w).Encode(api.FileList{Files: files, NextCursor: "cursor-2"}); err != nil {
++				t.Errorf("encoding first page: %v", err)
++			}
++		case 2:
++			if got := r.URL.Query().Get("cursor"); got != "cursor-2" {
++				t.Errorf("second cursor = %q, want cursor-2", got)
++			}
++			if err := json.NewEncoder(w).Encode(api.FileList{Files: []api.File{{ID: "id-100", FileName: "file-100", MimeType: "application/octet-stream"}}}); err != nil {
++				t.Errorf("encoding second page: %v", err)
++			}
++		default:
++			t.Errorf("unexpected listing request %d", requests)
++		}
++	}))
++	defer server.Close()
++	f := &Fs{
++		srv:   rest.NewClient(server.Client()).SetRoot(server.URL),
++		pacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(0), pacer.MaxSleep(0))),
++		opt:   Options{ListChunk: 1000}, // Old configs are clamped safely.
++	}
++	count := 0
++	found, err := f.listDirectoryWithFilter(ctx, "root", NewQueryFilter(), func(item *api.File) bool {
++		count++
++		return false
++	})
++	if err != nil {
++		t.Fatalf("listDirectoryWithFilter returned error: %v", err)
++	}
++	if found {
++		t.Fatal("listDirectoryWithFilter unexpectedly reported a match")
++	}
++	if requests != 2 || count != 101 {
++		t.Fatalf("requests=%d count=%d, want 2 and 101", requests, count)
++	}
++}
++
+ // TestModTimeSupport tests if the filesystem supports modification time preservation
+ func TestModTimeSupport(t *testing.T) {
+ 	f := &Fs{}
